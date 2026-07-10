@@ -18,5 +18,6 @@ int snprintf(char *buffer, size_t size, const char *format, ...);
 int vsnprintf(char *buffer, size_t size, const char *format, va_list args);
 int fputc(int character, FILE *stream);
 int putchar(int character);
+size_t fwrite(const void *buffer, size_t size, size_t count, FILE *stream);
 
 #endif

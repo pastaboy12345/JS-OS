@@ -11,6 +11,11 @@ typedef struct {
 } CpuidResult;
 
 void platform_init(uint64_t boot_epoch_seconds);
+void platform_run_constructors(void);
+void platform_configure_address_space(uint64_t hhdm_offset,
+                                      uint64_t kernel_physical_base,
+                                      uint64_t kernel_virtual_base);
+void *platform_map_mmio(uint64_t physical_address, uint64_t length);
 CpuidResult platform_cpuid(uint32_t leaf, uint32_t subleaf);
 uint64_t platform_rdtsc(void);
 uint64_t platform_tsc_hz(void);

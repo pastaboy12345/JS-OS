@@ -14,5 +14,9 @@ int strcmp(const char *left, const char *right);
 int strncmp(const char *left, const char *right, size_t count);
 char *strchr(const char *text, int character);
 char *strrchr(const char *text, int character);
+char *strstr(const char *text, const char *needle);
+char *strncpy(char *destination, const char *source, size_t count);
+char *strcat(char *destination, const char *source);
+char *strcpy(char *destination, const char *source);
 
 #endif

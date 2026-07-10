@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+#define alloca(size) __builtin_alloca(size)
+
 void *malloc(size_t size);
 void *calloc(size_t count, size_t size);
 void *realloc(void *pointer, size_t size);

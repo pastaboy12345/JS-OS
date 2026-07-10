@@ -1,6 +1,7 @@
 #include <jsos/api.h>
 #include <jsos/framebuffer.h>
 #include <jsos/heap.h>
+#include <jsos/keyboard.h>
 #include <jsos/platform.h>
 #include <jsos/runtime.h>
 
@@ -20,6 +21,12 @@ typedef struct {
 static JSRuntime *runtime;
 static JSContext *context;
 static RuntimeGuard guard;
+
+static uint64_t execution_deadline(void) {
+    uint64_t now = platform_uptime_us();
+    return now > UINT64_MAX - JS_EXECUTION_LIMIT_US
+        ? UINT64_MAX : now + JS_EXECUTION_LIMIT_US;
+}
 
 static void *runtime_malloc(JSMallocState *state, size_t size) {
     if (size == 0 || state->malloc_size > state->malloc_limit ||
@@ -100,7 +107,7 @@ static void promise_rejection_tracker(JSContext *quickjs_context,
         return;
     }
     const char *message = JS_ToCString(quickjs_context, reason);
-    console_write("[promise rejection] ");
+    console_write("quickjs: unhandled promise rejection: ");
     console_write(message == NULL ? "<unprintable>" : message);
     console_write("\n");
     if (message != NULL) {
@@ -111,7 +118,7 @@ static void promise_rejection_tracker(JSContext *quickjs_context,
 void js_runtime_report_exception(JSContext *quickjs_context) {
     JSValue exception = JS_GetException(quickjs_context);
     const char *message = JS_ToCString(quickjs_context, exception);
-    console_write("[QuickJS exception] ");
+    console_write("quickjs: ");
     console_write(message == NULL ? "<unprintable>" : message);
     console_write("\n");
     if (message != NULL) {
@@ -143,6 +150,7 @@ bool js_runtime_start(const char *source, size_t source_length,
     JS_SetMemoryLimit(runtime, JS_MEMORY_LIMIT);
     JS_SetMaxStackSize(runtime, JS_STACK_LIMIT);
     JS_SetCanBlock(runtime, false);
+    guard.deadline = UINT64_MAX;
     JS_SetInterruptHandler(runtime, interrupt_handler, &guard);
     JS_SetHostPromiseRejectionTracker(runtime, promise_rejection_tracker, NULL);
 
@@ -155,13 +163,28 @@ bool js_runtime_start(const char *source, size_t source_length,
     }
     if (jsos_install_api(context) < 0) {
         js_runtime_report_exception(context);
+        JS_FreeContext(context);
+        JS_FreeRuntime(runtime);
+        context = NULL;
+        runtime = NULL;
         return false;
     }
 
-    guard.deadline = platform_uptime_us() + JS_EXECUTION_LIMIT_US;
+    guard.deadline = execution_deadline();
     JSValue result = JS_Eval(context, source, source_length, filename,
                              JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT);
     guard.deadline = UINT64_MAX;
+    if (JS_IsException(result)) {
+        js_runtime_report_exception(context);
+        return false;
+    }
+    JS_FreeValue(context, result);
+    return js_runtime_drain_jobs() >= 0;
+}
+
+bool js_runtime_run(const char *source, size_t source_length,
+                    const char *filename) {
+    JSValue result = js_runtime_eval(source, source_length, filename);
     if (JS_IsException(result)) {
         js_runtime_report_exception(context);
         return false;
@@ -177,7 +200,7 @@ int js_runtime_drain_jobs(void) {
     int count = 0;
     while (JS_IsJobPending(runtime)) {
         JSContext *job_context = NULL;
-        guard.deadline = platform_uptime_us() + JS_EXECUTION_LIMIT_US;
+        guard.deadline = execution_deadline();
         int result = JS_ExecutePendingJob(runtime, &job_context);
         guard.deadline = UINT64_MAX;
         if (result < 0) {
@@ -208,9 +231,153 @@ JSValue js_runtime_eval(const char *source, size_t source_length,
     if (context == NULL) {
         return JS_EXCEPTION;
     }
-    guard.deadline = platform_uptime_us() + JS_EXECUTION_LIMIT_US;
+    guard.deadline = execution_deadline();
     JSValue result = JS_Eval(context, source, source_length, filename,
                              JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT);
     guard.deadline = UINT64_MAX;
     return result;
+}
+
+static void shell_print_result(JSValueConst result) {
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue formatter = JS_GetPropertyStr(context, global, "__shellFormat");
+    JSValue formatted = JS_UNDEFINED;
+    bool has_formatter = JS_IsFunction(context, formatter);
+    if (has_formatter) {
+        formatted = JS_Call(context, formatter, global, 1, &result);
+    }
+
+    const char *text = NULL;
+    if (!JS_IsException(formatted) && !JS_IsUndefined(formatted)) {
+        text = JS_ToCString(context, formatted);
+    }
+    if (!has_formatter && text == NULL && !JS_IsException(formatted)) {
+        text = JS_ToCString(context, result);
+    }
+    if (text != NULL) {
+        console_write(text);
+        console_write("\n");
+        JS_FreeCString(context, text);
+    } else if (JS_IsException(formatted)) {
+        js_runtime_report_exception(context);
+    }
+    JS_FreeValue(context, formatted);
+    JS_FreeValue(context, formatter);
+    JS_FreeValue(context, global);
+}
+
+static void shell_evaluate(const char *source, size_t length) {
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue evaluator = JS_GetPropertyStr(context, global, "__shellEval");
+    JSValue result;
+    if (JS_IsFunction(context, evaluator)) {
+        JSValue input = JS_NewStringLen(context, source, length);
+        guard.deadline = execution_deadline();
+        result = JS_Call(context, evaluator, global, 1, &input);
+        guard.deadline = UINT64_MAX;
+        JS_FreeValue(context, input);
+    } else {
+        result = js_runtime_eval(source, length, "<shell>");
+    }
+    JS_FreeValue(context, evaluator);
+    JS_FreeValue(context, global);
+    if (JS_IsException(result)) {
+        js_runtime_report_exception(context);
+        return;
+    }
+    shell_print_result(result);
+    JS_FreeValue(context, result);
+    js_runtime_drain_jobs();
+}
+
+static void shell_write_prompt(void) {
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue prompt = JS_GetPropertyStr(context, global, "__shellPrompt");
+    const char *text = JS_ToCString(context, prompt);
+    console_write(text == NULL ? "quickjs@jsos:~$ " : text);
+    if (text != NULL) {
+        JS_FreeCString(context, text);
+    }
+    JS_FreeValue(context, prompt);
+    JS_FreeValue(context, global);
+}
+
+_Noreturn void js_runtime_shell(void) {
+    char line[1024];
+    size_t length = 0;
+    bool cursor_visible = true;
+    uint64_t next_cursor_toggle = platform_uptime_us() + 500000;
+
+    keyboard_init();
+    shell_write_prompt();
+    console_set_cursor_visible(true);
+    for (;;) {
+        uint64_t now = platform_uptime_us();
+        if (now >= next_cursor_toggle) {
+            cursor_visible = !cursor_visible;
+            console_set_cursor_visible(cursor_visible);
+            next_cursor_toggle = now + 500000;
+        }
+
+        KeyboardEvent event;
+        if (!keyboard_read_event(&event)) {
+            __asm__ volatile ("pause");
+            continue;
+        }
+        console_set_cursor_visible(false);
+        cursor_visible = false;
+
+        if (event.type == KEYBOARD_EVENT_ENTER) {
+            console_write("\n");
+            if (length != 0) {
+                line[length] = '\0';
+                shell_evaluate(line, length);
+                length = 0;
+            }
+            shell_write_prompt();
+            cursor_visible = true;
+            console_set_cursor_visible(true);
+            next_cursor_toggle = platform_uptime_us() + 500000;
+            continue;
+        }
+        if (event.type == KEYBOARD_EVENT_BACKSPACE) {
+            if (length != 0) {
+                length--;
+                console_write("\b \b");
+            }
+            cursor_visible = true;
+            console_set_cursor_visible(true);
+            next_cursor_toggle = platform_uptime_us() + 500000;
+            continue;
+        }
+        if (event.type == KEYBOARD_EVENT_INTERRUPT) {
+            length = 0;
+            console_write("^C\n");
+            shell_write_prompt();
+            cursor_visible = true;
+            console_set_cursor_visible(true);
+            next_cursor_toggle = platform_uptime_us() + 500000;
+            continue;
+        }
+        char character = event.character;
+        if (event.type != KEYBOARD_EVENT_CHARACTER || character == '\t' ||
+                (unsigned char)character < 0x20 || (unsigned char)character >= 0x7f) {
+            cursor_visible = true;
+            console_set_cursor_visible(true);
+            continue;
+        }
+        if (length + 1 >= sizeof(line)) {
+            console_write("\nquickjs: input is limited to 1023 bytes\n");
+            length = 0;
+            shell_write_prompt();
+            cursor_visible = true;
+            console_set_cursor_visible(true);
+            continue;
+        }
+        line[length++] = character;
+        console_write_n(&character, 1);
+        cursor_visible = true;
+        console_set_cursor_visible(true);
+        next_cursor_toggle = platform_uptime_us() + 500000;
+    }
 }

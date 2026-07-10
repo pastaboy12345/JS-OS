@@ -1,11 +1,110 @@
 #include <jsos/platform.h>
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <string.h>
+
+#define PAGE_SIZE 4096ULL
 
 static uint64_t boot_tsc;
 static uint64_t tsc_frequency = 1000000000ULL;
 static uint64_t boot_epoch;
+static uint64_t direct_map_offset;
+static uint64_t executable_physical_base;
+static uint64_t executable_virtual_base;
+static uint8_t bootstrap_tls[PAGE_SIZE] __attribute__((aligned(16)));
+
+#define PAGE_ADDRESS_MASK 0x000ffffffffff000ULL
+#define PAGE_PRESENT 0x001ULL
+#define PAGE_WRITE 0x002ULL
+#define PAGE_WRITE_THROUGH 0x008ULL
+#define PAGE_CACHE_DISABLE 0x010ULL
+#define PAGE_HUGE 0x080ULL
+#define MMIO_TABLE_COUNT 64
+
+static uint8_t mmio_page_tables[MMIO_TABLE_COUNT][PAGE_SIZE]
+    __attribute__((aligned(PAGE_SIZE)));
+static size_t mmio_page_table_count;
+
+typedef void (*Initializer)(void);
+extern Initializer __init_array_start[];
+extern Initializer __init_array_end[];
+
+void platform_run_constructors(void) {
+    for (Initializer *initializer = __init_array_start;
+         initializer < __init_array_end; initializer++) {
+        (*initializer)();
+    }
+}
+
+void platform_configure_address_space(uint64_t hhdm_offset,
+                                      uint64_t kernel_physical_base,
+                                      uint64_t kernel_virtual_base) {
+    direct_map_offset = hhdm_offset;
+    executable_physical_base = kernel_physical_base;
+    executable_virtual_base = kernel_virtual_base;
+}
+
+static uint64_t table_physical_address(const void *table) {
+    return (uint64_t)(uintptr_t)table - executable_virtual_base +
+           executable_physical_base;
+}
+
+static volatile uint64_t *allocate_page_table(void) {
+    if (mmio_page_table_count >= MMIO_TABLE_COUNT) return NULL;
+    void *table = mmio_page_tables[mmio_page_table_count++];
+    memset(table, 0, PAGE_SIZE);
+    return table;
+}
+
+static bool map_mmio_page(uint64_t virtual_address, uint64_t physical_address) {
+    uint64_t cr3;
+    uint64_t cr4;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+    unsigned int levels = (cr4 & (1ULL << 12)) != 0 ? 5 : 4;
+    volatile uint64_t *table = (volatile uint64_t *)(uintptr_t)
+        (direct_map_offset + (cr3 & PAGE_ADDRESS_MASK));
+
+    for (unsigned int level = levels; level > 1; level--) {
+        unsigned int shift = 12 + (level - 1) * 9;
+        size_t index = (virtual_address >> shift) & 0x1ff;
+        uint64_t entry = table[index];
+        if ((entry & PAGE_PRESENT) != 0) {
+            if ((entry & PAGE_HUGE) != 0) {
+                uint64_t page_size = 1ULL << shift;
+                uint64_t mapped = (entry & ~(page_size - 1)) |
+                                  (virtual_address & (page_size - 1));
+                return (mapped & ~(PAGE_SIZE - 1)) == physical_address;
+            }
+            table = (volatile uint64_t *)(uintptr_t)
+                (direct_map_offset + (entry & PAGE_ADDRESS_MASK));
+            continue;
+        }
+        volatile uint64_t *next = allocate_page_table();
+        if (next == NULL) return false;
+        table[index] = table_physical_address((const void *)next) |
+                       PAGE_PRESENT | PAGE_WRITE;
+        table = next;
+    }
+
+    size_t index = (virtual_address >> 12) & 0x1ff;
+    table[index] = physical_address | PAGE_PRESENT | PAGE_WRITE |
+                   PAGE_WRITE_THROUGH | PAGE_CACHE_DISABLE;
+    __asm__ volatile ("invlpg (%0)" : : "r"(virtual_address) : "memory");
+    return true;
+}
+
+void *platform_map_mmio(uint64_t physical_address, uint64_t length) {
+    if (direct_map_offset == 0 || executable_virtual_base == 0 || length == 0 ||
+        physical_address > UINT64_MAX - length) return NULL;
+    uint64_t start = physical_address & ~(PAGE_SIZE - 1);
+    uint64_t end = (physical_address + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t page = start; page < end; page += PAGE_SIZE) {
+        if (!map_mmio_page(direct_map_offset + page, page)) return NULL;
+    }
+    return (void *)(uintptr_t)(direct_map_offset + physical_address);
+}
 
 uint8_t platform_in8(uint16_t port) {
     uint8_t value;
@@ -89,6 +188,11 @@ static void initialize_floating_point(void) {
 
 void platform_init(uint64_t boot_epoch_seconds) {
     initialize_floating_point();
+    uint64_t tls_base = (uint64_t)(uintptr_t)bootstrap_tls;
+    uint32_t tls_low = (uint32_t)tls_base;
+    uint32_t tls_high = (uint32_t)(tls_base >> 32);
+    __asm__ volatile ("wrmsr" : : "c"(0xc0000100U), "a"(tls_low), "d"(tls_high));
+    *(uint64_t *)(void *)(bootstrap_tls + 0x28) = platform_rdtsc() ^ 0x9e3779b97f4a7c15ULL;
     tsc_frequency = detect_tsc_frequency();
     if (tsc_frequency == 0) {
         tsc_frequency = 1000000000ULL;

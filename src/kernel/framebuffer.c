@@ -1,9 +1,14 @@
 #include <jsos/framebuffer.h>
 
 #include <jsos/font8x8_basic.h>
+#include <jsos/font.h>
 #include <jsos/serial.h>
+#include <jsos/vmware_svga.h>
 #include <limine.h>
 #include <string.h>
+
+#define CONSOLE_CELL_WIDTH 8ULL
+#define CONSOLE_CELL_HEIGHT 16ULL
 
 typedef struct {
     volatile uint8_t *address;
@@ -16,6 +21,13 @@ typedef struct {
 } FramebufferState;
 
 static FramebufferState state;
+
+static bool framebuffer_accelerated(void) {
+    SvgaInfo info = svga_info();
+    return info.available && info.width == state.info.width &&
+           info.height == state.info.height && info.pitch == state.info.pitch &&
+           info.bits_per_pixel == state.info.bpp;
+}
 
 bool framebuffer_init(const struct limine_framebuffer *framebuffer) {
     if (framebuffer == NULL || framebuffer->address == NULL ||
@@ -87,8 +99,46 @@ bool framebuffer_set_pixel(int64_t x, int64_t y, uint32_t color) {
     return true;
 }
 
+static uint8_t color_channel(uint32_t color, uint8_t size, uint8_t shift) {
+    if (size == 0) {
+        return 0;
+    }
+    uint32_t mask = size >= 32 ? UINT32_MAX : ((1U << size) - 1U);
+    uint32_t value = (color >> shift) & mask;
+    return size >= 8 ? (uint8_t)value : (uint8_t)((value * 255U) / mask);
+}
+
+bool framebuffer_blend_pixel(int64_t x, int64_t y, uint32_t color, uint8_t alpha) {
+    uint32_t destination;
+    if (!framebuffer_get_pixel(x, y, &destination)) {
+        return false;
+    }
+    if (alpha == 0) {
+        return true;
+    }
+    if (alpha == 255) {
+        return framebuffer_set_pixel(x, y, color);
+    }
+    uint32_t inverse = 255U - alpha;
+    uint8_t red = (uint8_t)((color_channel(color, state.info.red_size,
+        state.info.red_shift) * alpha + color_channel(destination,
+        state.info.red_size, state.info.red_shift) * inverse + 127U) / 255U);
+    uint8_t green = (uint8_t)((color_channel(color, state.info.green_size,
+        state.info.green_shift) * alpha + color_channel(destination,
+        state.info.green_size, state.info.green_shift) * inverse + 127U) / 255U);
+    uint8_t blue = (uint8_t)((color_channel(color, state.info.blue_size,
+        state.info.blue_shift) * alpha + color_channel(destination,
+        state.info.blue_size, state.info.blue_shift) * inverse + 127U) / 255U);
+    return framebuffer_set_pixel(x, y, framebuffer_rgb(red, green, blue));
+}
+
 void framebuffer_clear(uint32_t color) {
     if (!state.initialized) {
+        return;
+    }
+    if (framebuffer_accelerated() &&
+        svga_rect_fill(0, 0, (uint32_t)state.info.width,
+                       (uint32_t)state.info.height, color)) {
         return;
     }
     for (uint64_t y = 0; y < state.info.height; y++) {
@@ -121,6 +171,13 @@ void framebuffer_fill_rect(int64_t x, int64_t y, int64_t width, int64_t height,
     uint64_t end_y;
     if (!state.initialized || !clip_axis(x, width, state.info.width, &start_x, &end_x) ||
             !clip_axis(y, height, state.info.height, &start_y, &end_y)) {
+        return;
+    }
+    if ((end_x - start_x) * (end_y - start_y) >= 256 &&
+        framebuffer_accelerated() &&
+        svga_rect_fill((uint32_t)start_x, (uint32_t)start_y,
+                       (uint32_t)(end_x - start_x), (uint32_t)(end_y - start_y),
+                       color)) {
         return;
     }
     for (uint64_t row_index = start_y; row_index < end_y; row_index++) {
@@ -210,6 +267,92 @@ void framebuffer_circle(int64_t center_x, int64_t center_y, int64_t radius,
     }
 }
 
+void framebuffer_fill_rounded_rect(int64_t x, int64_t y, int64_t width,
+                                   int64_t height, int64_t radius,
+                                   uint32_t color) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    int64_t maximum_radius = (width < height ? width : height) / 2;
+    if (radius < 0) radius = 0;
+    if (radius > maximum_radius) radius = maximum_radius;
+    if (radius == 0) {
+        framebuffer_fill_rect(x, y, width, height, color);
+        return;
+    }
+    framebuffer_fill_rect(x + radius, y, width - radius * 2, height, color);
+    framebuffer_fill_rect(x, y + radius, width, height - radius * 2, color);
+    framebuffer_circle(x + radius, y + radius, radius, color, true);
+    framebuffer_circle(x + width - radius - 1, y + radius, radius, color, true);
+    framebuffer_circle(x + radius, y + height - radius - 1, radius, color, true);
+    framebuffer_circle(x + width - radius - 1, y + height - radius - 1,
+                       radius, color, true);
+}
+
+static int64_t edge(int64_t ax, int64_t ay, int64_t bx, int64_t by,
+                    int64_t px, int64_t py) {
+    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+}
+
+void framebuffer_fill_triangle(int64_t x0, int64_t y0, int64_t x1, int64_t y1,
+                               int64_t x2, int64_t y2, uint32_t color) {
+    int64_t min_x = x0 < x1 ? (x0 < x2 ? x0 : x2) : (x1 < x2 ? x1 : x2);
+    int64_t max_x = x0 > x1 ? (x0 > x2 ? x0 : x2) : (x1 > x2 ? x1 : x2);
+    int64_t min_y = y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2);
+    int64_t max_y = y0 > y1 ? (y0 > y2 ? y0 : y2) : (y1 > y2 ? y1 : y2);
+    if (min_x < 0) min_x = 0;
+    if (min_y < 0) min_y = 0;
+    if (max_x >= (int64_t)state.info.width) max_x = (int64_t)state.info.width - 1;
+    if (max_y >= (int64_t)state.info.height) max_y = (int64_t)state.info.height - 1;
+    int64_t area = edge(x0, y0, x1, y1, x2, y2);
+    for (int64_t y = min_y; y <= max_y; y++) {
+        for (int64_t x = min_x; x <= max_x; x++) {
+            int64_t a = edge(x0, y0, x1, y1, x, y);
+            int64_t b = edge(x1, y1, x2, y2, x, y);
+            int64_t c = edge(x2, y2, x0, y0, x, y);
+            if ((area >= 0 && a >= 0 && b >= 0 && c >= 0) ||
+                    (area < 0 && a <= 0 && b <= 0 && c <= 0)) {
+                framebuffer_set_pixel(x, y, color);
+            }
+        }
+    }
+}
+
+void framebuffer_put_rgba(int64_t x, int64_t y, uint32_t width, uint32_t height,
+                          const uint8_t *pixels, size_t length) {
+    if (pixels == NULL || width == 0 || height == 0 ||
+            (uint64_t)width * height > length / 4) {
+        return;
+    }
+    for (uint32_t row = 0; row < height; row++) {
+        for (uint32_t column = 0; column < width; column++) {
+            size_t offset = ((size_t)row * width + column) * 4;
+            uint32_t color = framebuffer_rgb(pixels[offset], pixels[offset + 1],
+                                             pixels[offset + 2]);
+            framebuffer_blend_pixel(x + column, y + row, color, pixels[offset + 3]);
+        }
+    }
+}
+
+bool framebuffer_copy_rect(int64_t source_x, int64_t source_y,
+                           int64_t destination_x, int64_t destination_y,
+                           uint32_t width, uint32_t height) {
+    if (!state.initialized || source_x < 0 || source_y < 0 ||
+        destination_x < 0 || destination_y < 0 || !framebuffer_accelerated()) {
+        return false;
+    }
+    return svga_rect_copy((uint32_t)source_x, (uint32_t)source_y,
+                          (uint32_t)destination_x, (uint32_t)destination_y,
+                          width, height);
+}
+
+void framebuffer_present(void) {
+    if (svga_ready()) {
+        svga_update(0, 0, (uint32_t)state.info.width, (uint32_t)state.info.height);
+        svga_sync();
+    }
+}
+
 static void framebuffer_character(int64_t x, int64_t y, unsigned char character,
                                   uint32_t color, uint32_t scale) {
     if (character >= 128) {
@@ -233,6 +376,9 @@ void framebuffer_text(int64_t x, int64_t y, const char *text, uint32_t color,
     if (!state.initialized || text == NULL || scale == 0 || scale > 32) {
         return;
     }
+    if (font_draw_text(x, y, text, color, scale * 8)) {
+        return;
+    }
     int64_t origin_x = x;
     while (*text != '\0') {
         unsigned char character = (unsigned char)*text++;
@@ -248,6 +394,9 @@ void framebuffer_text(int64_t x, int64_t y, const char *text, uint32_t color,
 
 void framebuffer_measure_text(const char *text, uint32_t scale,
                               uint64_t *width, uint64_t *height) {
+    if (font_measure_text(text, scale * 8, width, height)) {
+        return;
+    }
     uint64_t current = 0;
     uint64_t maximum = 0;
     uint64_t lines = 1;
@@ -301,22 +450,55 @@ void console_get_cursor(uint64_t *column, uint64_t *row) {
     }
 }
 
+void console_set_cursor_visible(bool visible) {
+    if (!state.initialized) {
+        return;
+    }
+    framebuffer_fill_rect(state.cursor_column * CONSOLE_CELL_WIDTH,
+                          state.cursor_row * CONSOLE_CELL_HEIGHT,
+                          CONSOLE_CELL_WIDTH, CONSOLE_CELL_HEIGHT,
+                          visible ? state.foreground : state.background);
+}
+
 static void console_scroll(void) {
-    const uint64_t pixels = 8;
+    const uint64_t pixels = CONSOLE_CELL_HEIGHT;
     if (!state.initialized || state.info.height <= pixels) {
         return;
     }
-    for (uint64_t y = 0; y < state.info.height - pixels; y++) {
-        volatile uint32_t *destination = (volatile uint32_t *)(state.address + y * state.info.pitch);
-        volatile uint32_t *source = (volatile uint32_t *)(state.address + (y + pixels) * state.info.pitch);
-        for (uint64_t x = 0; x < state.info.width; x++) {
-            destination[x] = source[x];
+    if (!framebuffer_copy_rect(0, pixels, 0, 0, (uint32_t)state.info.width,
+                               (uint32_t)(state.info.height - pixels))) {
+        for (uint64_t y = 0; y < state.info.height - pixels; y++) {
+            volatile uint32_t *destination = (volatile uint32_t *)(state.address + y * state.info.pitch);
+            volatile uint32_t *source = (volatile uint32_t *)(state.address + (y + pixels) * state.info.pitch);
+            for (uint64_t x = 0; x < state.info.width; x++) {
+                destination[x] = source[x];
+            }
         }
     }
     framebuffer_fill_rect(0, state.info.height - pixels, state.info.width, pixels,
                           state.background);
     if (state.cursor_row > 0) {
         state.cursor_row--;
+    }
+}
+
+static void console_character(uint64_t column, uint64_t row,
+                              unsigned char character) {
+    if (character >= 128) {
+        character = '?';
+    }
+    int64_t x = (int64_t)(column * CONSOLE_CELL_WIDTH);
+    int64_t y = (int64_t)(row * CONSOLE_CELL_HEIGHT);
+    framebuffer_fill_rect(x, y, CONSOLE_CELL_WIDTH, CONSOLE_CELL_HEIGHT,
+                          state.background);
+    for (uint32_t glyph_row = 0; glyph_row < 8; glyph_row++) {
+        unsigned char bits = font8x8_basic[character][glyph_row];
+        for (uint32_t glyph_column = 0; glyph_column < 8; glyph_column++) {
+            if ((bits & (1U << glyph_column)) != 0) {
+                framebuffer_fill_rect(x + glyph_column, y + glyph_row * 2,
+                                      1, 2, state.foreground);
+            }
+        }
     }
 }
 
@@ -328,10 +510,23 @@ void console_write_n(const char *text, size_t length) {
     if (!state.initialized) {
         return;
     }
-    uint64_t columns = state.info.width / 8;
-    uint64_t rows = state.info.height / 8;
+    uint64_t columns = state.info.width / CONSOLE_CELL_WIDTH;
+    uint64_t rows = state.info.height / CONSOLE_CELL_HEIGHT;
     for (size_t i = 0; i < length; i++) {
         unsigned char character = (unsigned char)text[i];
+        if (character == '\b') {
+            if (state.cursor_column > 0) {
+                state.cursor_column--;
+            } else if (state.cursor_row > 0 && columns > 0) {
+                state.cursor_row--;
+                state.cursor_column = columns - 1;
+            }
+            framebuffer_fill_rect(state.cursor_column * CONSOLE_CELL_WIDTH,
+                                  state.cursor_row * CONSOLE_CELL_HEIGHT,
+                                  CONSOLE_CELL_WIDTH, CONSOLE_CELL_HEIGHT,
+                                  state.background);
+            continue;
+        }
         if (character == '\r') {
             state.cursor_column = 0;
             continue;
@@ -340,10 +535,7 @@ void console_write_n(const char *text, size_t length) {
             state.cursor_column = 0;
             state.cursor_row++;
         } else {
-            framebuffer_fill_rect(state.cursor_column * 8, state.cursor_row * 8,
-                                  8, 8, state.background);
-            framebuffer_character(state.cursor_column * 8, state.cursor_row * 8,
-                                  character, state.foreground, 1);
+            console_character(state.cursor_column, state.cursor_row, character);
             state.cursor_column++;
             if (state.cursor_column >= columns) {
                 state.cursor_column = 0;

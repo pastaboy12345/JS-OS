@@ -34,6 +34,71 @@ void *memmove(void *destination, const void *source, size_t count) {
     return destination;
 }
 
+char *strstr(const char *text, const char *needle) {
+    if (*needle == '\0') {
+        return (char *)text;
+    }
+    for (; *text != '\0'; text++) {
+        const char *left = text;
+        const char *right = needle;
+        while (*right != '\0' && *left == *right) {
+            left++;
+            right++;
+        }
+        if (*right == '\0') {
+            return (char *)text;
+        }
+    }
+    return NULL;
+}
+
+char *strncpy(char *destination, const char *source, size_t count) {
+    size_t index = 0;
+    while (index < count && source[index] != '\0') {
+        destination[index] = source[index];
+        index++;
+    }
+    while (index < count) {
+        destination[index++] = '\0';
+    }
+    return destination;
+}
+
+char *strcat(char *destination, const char *source) {
+    char *end = destination + strlen(destination);
+    while ((*end++ = *source++) != '\0') {}
+    return destination;
+}
+
+char *strcpy(char *destination, const char *source) {
+    char *result = destination;
+    while ((*destination++ = *source++) != '\0') {}
+    return result;
+}
+
+static unsigned char ascii_lower(unsigned char value) {
+    return value >= 'A' && value <= 'Z' ? (unsigned char)(value + ('a' - 'A')) : value;
+}
+
+int strcasecmp(const char *left, const char *right) {
+    while (*left != '\0' && ascii_lower((unsigned char)*left) == ascii_lower((unsigned char)*right)) {
+        left++;
+        right++;
+    }
+    return (int)ascii_lower((unsigned char)*left) - (int)ascii_lower((unsigned char)*right);
+}
+
+int strncasecmp(const char *left, const char *right, size_t count) {
+    while (count != 0 && *left != '\0' &&
+           ascii_lower((unsigned char)*left) == ascii_lower((unsigned char)*right)) {
+        left++;
+        right++;
+        count--;
+    }
+    return count == 0 ? 0 : (int)ascii_lower((unsigned char)*left) -
+        (int)ascii_lower((unsigned char)*right);
+}
+
 void *memset(void *destination, int value, size_t count) {
     unsigned char *output = destination;
     for (size_t i = 0; i < count; i++) {
@@ -481,8 +546,8 @@ int snprintf(char *buffer, size_t size, const char *format, ...) {
     return result;
 }
 
-static JSOS_FILE standard_output_file = { .descriptor = 1 };
-static JSOS_FILE standard_error_file = { .descriptor = 2 };
+static FILE standard_output_file = { .descriptor = 1 };
+static FILE standard_error_file = { .descriptor = 2 };
 FILE *stdout = &standard_output_file;
 FILE *stderr = &standard_error_file;
 
@@ -522,6 +587,18 @@ int putchar(int character) {
     return fputc(character, stdout);
 }
 
+size_t fwrite(const void *buffer, size_t size, size_t count, FILE *stream) {
+    (void)stream;
+    if (buffer == NULL || size == 0 || count == 0) {
+        return 0;
+    }
+    if (count > SIZE_MAX / size) {
+        return 0;
+    }
+    serial_write_n(buffer, size * count);
+    return count;
+}
+
 int gettimeofday(struct timeval *time_value, void *timezone) {
     (void)timezone;
     if (time_value == NULL) {
@@ -559,6 +636,14 @@ int fesetround(int mode) {
     mxcsr = (mxcsr & ~(3U << 13)) | ((uint32_t)mode << 13);
     __asm__ volatile ("ldmxcsr %0" : : "m"(mxcsr));
     return 0;
+}
+
+double creal(double _Complex value) {
+    return __real__ value;
+}
+
+double cimag(double _Complex value) {
+    return __imag__ value;
 }
 
 void jsos_assert_fail(const char *expression, const char *file, int line) {
