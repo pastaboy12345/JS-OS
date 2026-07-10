@@ -1,5 +1,5 @@
 CC = x86_64-elf-gcc
-CFLAGS = -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mno-red-zone -Wall -Wextra -Ilimine
+CFLAGS = -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mno-red-zone -mcmodel=kernel -Wall -Wextra -Ilimine
 LDFLAGS = -nostdlib -z max-page-size=0x1000 -T linker.ld
 
 all: quickboot.iso
